@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"sync"
 	"time"
 )
 
@@ -28,24 +29,16 @@ const (
 	LOG_SHIFT_BY_MINUTE
 )
 
-const LOG_DEFAULT_TICKER_INTERVAL = 1 * time.Second
-
-type LogBufferInfo struct {
-	content string
-	time    time.Time
-}
-
 type Log struct {
-	log_path            string
-	log_prefix          string
-	log_level           int
-	log_num             int
-	log_size            int64
-	log_shift_type      int
-	log_buffer          map[int]LogBufferInfo
-	log_buffer_ttl      time.Duration
-	check_buffer_ticker *time.Ticker
-	closed              chan bool
+	log_path       string
+	log_prefix     string
+	log_level      int
+	log_num        int
+	log_size       int64
+	log_shift_type int
+	file           *os.File
+	log_filename   string
+	mutex          *sync.Mutex
 }
 
 // create Log obj
@@ -56,45 +49,35 @@ type Log struct {
 // log_size: max log file size (bytes), only enabled in LOG_SHIFT_BY_SIZE
 // log_shift_type: defined in this package, etc: LOG_SHIFT_BY_SIZE
 // log_buffer_ttl: only for "buffer-flush" log, if log content hasn't be flushed and time reaches ttl, it will force log content to flush to the file.
-func NewRawLog(log_path string, log_prefix string, log_level int, log_num int, log_size int64,
-	log_shift_type int, log_buffer_ttl time.Duration) *Log {
-	var l Log
+func NewLog(log_path string, log_prefix string, log_level int, log_num int, log_size int64,
+	log_shift_type int) *Log {
+	l := new(Log)
 	l.log_path = log_path
 	l.log_prefix = log_prefix
 	l.log_level = log_level
 	l.log_num = log_num
 	l.log_size = log_size
 	l.log_shift_type = log_shift_type
-	l.log_buffer = make(map[int]LogBufferInfo)
-	l.log_buffer_ttl = log_buffer_ttl
-	l.closed = make(chan bool)
+	l.mutex = new(sync.Mutex)
 
 	//todo: check arguments
-
-	if log_buffer_ttl > 0 {
-		go l.checkLogExpire()
-	}
-	return &l
+	return l
 }
 
 // modify log config
 func (l *Log) ModConf(log_path string, log_prefix string, log_level int, log_num int, log_size int64,
-	log_shift_type int, log_buffer_ttl time.Duration) {
+	log_shift_type int) {
 	l.log_path = log_path
 	l.log_prefix = log_prefix
 	l.log_level = log_level
 	l.log_num = log_num
 	l.log_size = log_size
 	l.log_shift_type = log_shift_type
-	l.log_buffer_ttl = log_buffer_ttl
-
-	//todo: check ttl > 0, restart checkLogExpire()
 }
 
 func (l *Log) Close() {
-	if l.check_buffer_ticker != nil {
-		l.check_buffer_ticker.Stop()
-		l.closed <- true
+	if l.file != nil {
+		l.file.Close()
 	}
 }
 
@@ -104,8 +87,9 @@ func (l *Log) RawLog(content string) (err error) {
 		if file, err = l.getLogFile(); err != nil {
 			return err
 		}
-		defer file.Close()
 
+		l.mutex.Lock()
+		defer l.mutex.Unlock()
 		if _, err = fmt.Fprintln(file, content); err != nil {
 			return err
 		}
@@ -115,67 +99,50 @@ func (l *Log) RawLog(content string) (err error) {
 	return nil
 }
 
-func (l *Log) LogTrace(buffer_idx int, format string, v ...interface{}) {
+func (l *Log) LogTrace(format string, v ...interface{}) {
 	if l.log_level >= LOG_LEVEL_TRACE {
-		l.logFormat(buffer_idx, LOG_LEVEL_TRACE, format, v...)
+		l.logFormat(LOG_LEVEL_TRACE, format, v...)
 	}
 }
 
-func (l *Log) LogDebug(buffer_idx int, format string, v ...interface{}) {
+func (l *Log) LogDebug(format string, v ...interface{}) {
 	if l.log_level >= LOG_LEVEL_DEBUG {
-		l.logFormat(buffer_idx, LOG_LEVEL_DEBUG, format, v...)
+		l.logFormat(LOG_LEVEL_DEBUG, format, v...)
 	}
 }
 
-func (l *Log) LogInfo(buffer_idx int, format string, v ...interface{}) {
+func (l *Log) LogInfo(format string, v ...interface{}) {
 	if l.log_level >= LOG_LEVEL_INFO {
-		l.logFormat(buffer_idx, LOG_LEVEL_INFO, format, v...)
+		l.logFormat(LOG_LEVEL_INFO, format, v...)
 	}
 }
 
-func (l *Log) LogWarn(buffer_idx int, format string, v ...interface{}) {
+func (l *Log) LogWarn(format string, v ...interface{}) {
 	if l.log_level >= LOG_LEVEL_WARN {
-		l.logFormat(buffer_idx, LOG_LEVEL_WARN, format, v...)
+		l.logFormat(LOG_LEVEL_WARN, format, v...)
 	}
 }
 
-func (l *Log) LogError(buffer_idx int, format string, v ...interface{}) {
+func (l *Log) LogError(format string, v ...interface{}) {
 	if l.log_level >= LOG_LEVEL_ERROR {
-		l.logFormat(buffer_idx, LOG_LEVEL_ERROR, format, v...)
+		l.logFormat(LOG_LEVEL_ERROR, format, v...)
 	}
 }
 
-func (l *Log) LogFatal(buffer_idx int, format string, v ...interface{}) {
+func (l *Log) LogFatal(format string, v ...interface{}) {
 	if l.log_level >= LOG_LEVEL_FATAL {
-		l.logFormat(buffer_idx, LOG_LEVEL_FATAL, format, v...)
+		l.logFormat(LOG_LEVEL_FATAL, format, v...)
 	}
 }
 
 //easy way to log content to file
-func (l *Log) Log(buffer_idx int, format string, v ...interface{}) {
-	l.logFormat(buffer_idx, LOG_LEVEL_ALL, format, v...)
+func (l *Log) Log(format string, v ...interface{}) {
+	l.logFormat(LOG_LEVEL_ALL, format, v...)
 }
 
-func (l *Log) FlushLogBuffer(buffer_idx int) {
-	if buffer_info, ok := l.log_buffer[buffer_idx]; ok {
-		l.RawLog(buffer_info.content + fmt.Sprintf("\nLog Buffer end, Key=%d\n", buffer_idx))
-		delete(l.log_buffer, buffer_idx)
-	}
-}
-
-func (l *Log) logFormat(buffer_idx int, log_level int, format string, v ...interface{}) {
+func (l *Log) logFormat(log_level int, format string, v ...interface{}) {
 	log_content := l.formatLogContent(log_level, format, v...)
-
-	if buffer_idx != 0 {
-		if buffer_info, ok := l.log_buffer[buffer_idx]; ok {
-			buffer_info.content = buffer_info.content + "\n" + log_content
-			l.log_buffer[buffer_idx] = buffer_info
-		} else {
-			l.log_buffer[buffer_idx] = LogBufferInfo{fmt.Sprintf("\nLog Buffer Start, Key=%d\n", buffer_idx) + log_content, time.Now()}
-		}
-	} else {
-		l.RawLog(log_content)
-	}
+	l.RawLog(log_content)
 }
 
 func (l *Log) formatLogContent(log_level int, format string, v ...interface{}) string {
@@ -208,73 +175,86 @@ func (l *Log) formatLogContent(log_level int, format string, v ...interface{}) s
 	return log_content
 }
 
-func (l *Log) checkLogExpire() {
-	l.check_buffer_ticker = time.NewTicker(LOG_DEFAULT_TICKER_INTERVAL)
-	for {
-		select {
-		case <-l.check_buffer_ticker.C:
-			for idx, value := range l.log_buffer {
-				if duration := time.Since(value.time); duration >= l.log_buffer_ttl {
-					l.FlushLogBuffer(idx)
-				}
-			}
-		case <-l.closed:
-			for idx, _ := range l.log_buffer {
-				l.FlushLogBuffer(idx)
-			}
-			return
-		}
+func (l *Log) reopen(filename string) (err error) {
+	if l.file != nil {
+		l.file.Close()
 	}
-}
-
-func (l *Log) shiftLogFile() (err error) {
-	cur_logfile := l.getLogFileName(0)
-	var file *os.File
-	var stat os.FileInfo
-	if file, err = os.OpenFile(cur_logfile, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666); err != nil {
+	l.file, err = os.OpenFile(filename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666)
+	if err != nil {
 		return err
-	}
-	defer file.Close()
-	if stat, err = file.Stat(); err != nil {
-		return err
-	}
-
-	if l.log_shift_type == LOG_SHIFT_BY_SIZE {
-		if stat.Size() >= l.log_size {
-			for i := l.log_num - 2; i >= 0; i-- {
-				var filename string = l.getLogFileName(i)
-				if _, err := os.Stat(filename); err == nil {
-					os.Rename(filename, l.getLogFileName(i+1))
-				}
-			}
-		}
-	} else if l.log_shift_type == LOG_SHIFT_BY_DAY {
-		cur_time_str := time.Now().Format("20060102")
-		if cur_time_str != stat.ModTime().Format("20060102") {
-			os.Rename(cur_logfile, cur_logfile+"."+cur_time_str)
-		}
-	} else if l.log_shift_type == LOG_SHIFT_BY_HOUR {
-		cur_time_str := time.Now().Format("20060102-15")
-		if cur_time_str != stat.ModTime().Format("20060102-15") {
-			os.Rename(cur_logfile, cur_logfile+"."+cur_time_str)
-		}
-	} else if l.log_shift_type == LOG_SHIFT_BY_MINUTE {
-		cur_time_str := time.Now().Format("20060102-1504")
-		if cur_time_str != stat.ModTime().Format("20060102-1504") {
-			os.Rename(cur_logfile, cur_logfile+"."+cur_time_str)
-		}
 	}
 	return nil
 }
 
+func (l *Log) shiftLogFile(filename string) (err error) {
+	if filename != l.log_filename {
+		if err = l.reopen(filename); err != nil {
+			return err
+		}
+		l.log_filename = filename
+	} else if l.file != nil {
+		var stat os.FileInfo
+		if stat, err = l.file.Stat(); err != nil {
+			return err
+		}
+
+		if l.log_shift_type == LOG_SHIFT_BY_SIZE {
+			if stat.Size() >= l.log_size {
+				l.mutex.Lock()
+				defer l.mutex.Unlock()
+				for i := l.log_num - 2; i >= 0; i-- {
+					var next_filename string = l.getLogFileName(i)
+					if _, err := os.Stat(filename); err == nil {
+						os.Rename(next_filename, l.getLogFileName(i+1))
+					}
+				}
+				if err = l.reopen(filename); err != nil {
+					return err
+				}
+			}
+		} else {
+			var shift_time_str string
+			do_shift := false
+			now := time.Now()
+			if l.log_shift_type == LOG_SHIFT_BY_DAY {
+				if now.Format("20060102") != stat.ModTime().Format("20060102") {
+					shift_time_str = now.Add(-24 * time.Hour).Format("20060102")
+					do_shift = true
+				}
+			} else if l.log_shift_type == LOG_SHIFT_BY_HOUR {
+				if now.Format("20060102-15") != stat.ModTime().Format("20060102-15") {
+					shift_time_str = now.Add(-1 * time.Hour).Format("20060102-15")
+					do_shift = true
+				}
+			} else if l.log_shift_type == LOG_SHIFT_BY_MINUTE {
+				if now.Format("20060102-1504") != stat.ModTime().Format("20060102-1504") {
+					shift_time_str = now.Add(-1 * time.Minute).Format("20060102-1504")
+					do_shift = true
+				}
+			}
+
+			if do_shift {
+				l.mutex.Lock()
+				defer l.mutex.Unlock()
+				shift_filename := filename + "." + shift_time_str
+				os.Rename(filename, shift_filename)
+				if err = l.reopen(filename); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
 func (l *Log) getLogFile() (file *os.File, err error) {
-	l.shiftLogFile()
-	cur_logfile := l.getLogFileName(0)
-	if file, err = os.OpenFile(cur_logfile, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0666); err != nil {
+	log_filename := l.getLogFileName(0)
+	if err = l.shiftLogFile(log_filename); err != nil {
 		return nil, err
 	}
 
-	return file, nil
+	return l.file, nil
 }
 
 func (l *Log) getLogFileName(idx int) (name string) {
